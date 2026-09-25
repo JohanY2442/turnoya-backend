@@ -1,0 +1,988 @@
+[33mcommit cb087c893c5023133b194361fd963251b4990d36[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mfix/brid-errores[m[33m)[m
+Author: Leyrin Bridneys Aguilar Jorge <soporte2@wimperu.org>
+Date:   Thu Sep 24 23:11:40 2026 +0000
+
+    feat(errores): validaciones, async, eventos de turno y notificaciones por email
+    
+    - GlobalExceptionHandler: agrega manejo de MethodArgumentNotValidException
+      devolviendo, por cada campo invalido, su mensaje de validacion.
+    - AsyncConfig: @EnableAsync + ThreadPoolTaskExecutor (bean "taskExecutor")
+      y manejo de excepciones no controladas en tareas asincronas.
+    - Sistema de eventos: TurnoEvent/TipoEventoTurno (evento desacoplado de las
+      entidades JPA, con datos ya resueltos para evitar LazyInitializationException
+      en el listener async) + TurnoEventListener (@Async @EventListener).
+    - EmailService/EmailServiceImpl: envia el correo de notificacion de turno
+      usando una plantilla HTML (Thymeleaf, templates/email/turno-notificacion.html)
+      vía JavaMailSender, y registra cada envio exitoso en Notificacion.
+    - Entidades minimas Usuario y Notificacion (estaban vacias): se completaron
+      solo con los campos ya acordados en la propuesta tecnica, para que este
+      modulo compile; deben reconciliarse con la version definitiva de Backend &
+      Database Architecture antes de mergear a develop.
+    - TurnoEventTestController (paquete "dev"): endpoint temporal para probar el
+      flujo evento -> correo -> Notificacion mientras el TurnoService real no
+      exista; debe borrarse cuando ese servicio publique el evento de verdad.
+    - pom.xml: se agregan spring-boot-starter-mail y spring-boot-starter-thymeleaf.
+    - Tests: GlobalExceptionHandlerTest y TurnoEventListenerTest.
+    
+    Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+[1mdiff --git a/pom.xml b/pom.xml[m
+[1mindex 16f89ef..c0b60c5 100644[m
+[1m--- a/pom.xml[m
+[1m+++ b/pom.xml[m
+[36m@@ -42,6 +42,14 @@[m
+             <groupId>org.springframework.boot</groupId>[m
+             <artifactId>spring-boot-starter-webmvc</artifactId>[m
+         </dependency>[m
+[32m+[m[32m        <dependency>[m
+[32m+[m[32m            <groupId>org.springframework.boot</groupId>[m
+[32m+[m[32m            <artifactId>spring-boot-starter-mail</artifactId>[m
+[32m+[m[32m        </dependency>[m
+[32m+[m[32m        <dependency>[m
+[32m+[m[32m            <groupId>org.springframework.boot</groupId>[m
+[32m+[m[32m            <artifactId>spring-boot-starter-thymeleaf</artifactId>[m
+[32m+[m[32m        </dependency>[m
+ [m
+         <dependency>[m
+             <groupId>org.postgresql</groupId>[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/config/AsyncConfig.java b/src/main/java/com/turnoya/turnoyabackend/config/AsyncConfig.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..c383b92[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/config/AsyncConfig.java[m
+[36m@@ -0,0 +1,60 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.config;[m
+[32m+[m
+[32m+[m[32mimport org.slf4j.Logger;[m
+[32m+[m[32mimport org.slf4j.LoggerFactory;[m
+[32m+[m[32mimport org.springframework.aop.interceptor.AsyncUncaughtExceptionHandler;[m
+[32m+[m[32mimport org.springframework.context.annotation.Bean;[m
+[32m+[m[32mimport org.springframework.context.annotation.Configuration;[m
+[32m+[m[32mimport org.springframework.scheduling.annotation.AsyncConfigurer;[m
+[32m+[m[32mimport org.springframework.scheduling.annotation.EnableAsync;[m
+[32m+[m[32mimport org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;[m
+[32m+[m
+[32m+[m[32mimport java.lang.reflect.Method;[m
+[32m+[m[32mimport java.util.concurrent.Executor;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Configuración de ejecución asíncrona para TurnoYa.[m
+[32m+[m[32m * <p>[m
+[32m+[m[32m * Habilita {@code @Async} en toda la aplicación y define el[m
+[32m+[m[32m * {@link ThreadPoolTaskExecutor} que usan, entre otros, el listener de eventos[m
+[32m+[m[32m * de turno ({@code TurnoEventListener}) para el envío de notificaciones por[m
+[32m+[m[32m * correo, de modo que estas operaciones no bloqueen el hilo que atiende la[m
+[32m+[m[32m * petición HTTP del paciente/médico.[m
+[32m+[m[32m */[m
+[32m+[m[32m@Configuration[m
+[32m+[m[32m@EnableAsync[m
+[32m+[m[32mpublic class AsyncConfig implements AsyncConfigurer {[m
+[32m+[m
+[32m+[m[32m    private static final Logger log = LoggerFactory.getLogger(AsyncConfig.class);[m
+[32m+[m
+[32m+[m[32m    public static final String TASK_EXECUTOR_BEAN = "taskExecutor";[m
+[32m+[m
+[32m+[m[32m    @Bean(name = TASK_EXECUTOR_BEAN)[m
+[32m+[m[32m    @Override[m
+[32m+[m[32m    public Executor getAsyncExecutor() {[m
+[32m+[m[32m        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();[m
+[32m+[m[32m        executor.setCorePoolSize(4);[m
+[32m+[m[32m        executor.setMaxPoolSize(10);[m
+[32m+[m[32m        executor.setQueueCapacity(100);[m
+[32m+[m[32m        executor.setThreadNamePrefix("turnoya-async-");[m
+[32m+[m[32m        executor.setWaitForTasksToCompleteOnShutdown(true);[m
+[32m+[m[32m        executor.setAwaitTerminationSeconds(20);[m
+[32m+[m[32m        executor.initialize();[m
+[32m+[m[32m        return executor;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    /**[m
+[32m+[m[32m     * Captura cualquier excepción que escape de un método {@code @Async void}[m
+[32m+[m[32m     * (los métodos void no permiten propagar la excepción al llamador), para[m
+[32m+[m[32m     * que quede registrada en logs en vez de perderse silenciosamente.[m
+[32m+[m[32m     */[m
+[32m+[m[32m    @Override[m
+[32m+[m[32m    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {[m
+[32m+[m[32m        return this::manejarErrorAsincrono;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    private void manejarErrorAsincrono(Throwable throwable, Method method, Object... params) {[m
+[32m+[m[32m        log.error("Error no controlado ejecutando la tarea asíncrona '{}': {}",[m
+[32m+[m[32m                method.getName(), throwable.getMessage(), throwable);[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/dev/TurnoEventTestController.java b/src/main/java/com/turnoya/turnoyabackend/dev/TurnoEventTestController.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..db737e8[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/dev/TurnoEventTestController.java[m
+[36m@@ -0,0 +1,68 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.dev;[m
+[32m+[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.event.TipoEventoTurno;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.event.TurnoEvent;[m
+[32m+[m[32mimport jakarta.validation.constraints.NotBlank;[m
+[32m+[m[32mimport jakarta.validation.constraints.NotNull;[m
+[32m+[m[32mimport org.springframework.context.ApplicationEventPublisher;[m
+[32m+[m[32mimport org.springframework.http.ResponseEntity;[m
+[32m+[m[32mimport org.springframework.web.bind.annotation.PostMapping;[m
+[32m+[m[32mimport org.springframework.web.bind.annotation.RequestBody;[m
+[32m+[m[32mimport org.springframework.web.bind.annotation.RequestMapping;[m
+[32m+[m[32mimport org.springframework.web.bind.annotation.RestController;[m
+[32m+[m
+[32m+[m[32mimport jakarta.validation.Valid;[m
+[32m+[m[32mimport java.time.LocalDateTime;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Endpoint TEMPORAL solo para pruebas manuales del módulo de eventos/correo[m
+[32m+[m[32m * mientras el servicio real de Turnos (creado por el resto del equipo) todavía[m
+[32m+[m[32m * no existe.[m
+[32m+[m[32m * <p>[m
+[32m+[m[32m * Sirve para comprobar de punta a punta: publicar {@link TurnoEvent} -&gt;[m
+[32m+[m[32m * {@code TurnoEventListener} (async) -&gt; {@code EmailService} -&gt; correo +[m
+[32m+[m[32m * registro en {@code Notificacion}.[m
+[32m+[m[32m * <p>[m
+[32m+[m[32m * <b>Cuando el servicio real de Turnos exista, este controlador debe[m
+[32m+[m[32m * eliminarse</b> y la publicación del evento debe hacerse desde allí[m
+[32m+[m[32m * (por ejemplo, en {@code TurnoService.crearTurno(...)}), tal como se explica[m
+[32m+[m[32m * en el Javadoc de {@link TurnoEvent}.[m
+[32m+[m[32m */[m
+[32m+[m[32m@RestController[m
+[32m+[m[32m@RequestMapping("/api/dev/turno-events")[m
+[32m+[m[32mpublic class TurnoEventTestController {[m
+[32m+[m
+[32m+[m[32m    private final ApplicationEventPublisher eventPublisher;[m
+[32m+[m
+[32m+[m[32m    public TurnoEventTestController(ApplicationEventPublisher eventPublisher) {[m
+[32m+[m[32m        this.eventPublisher = eventPublisher;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @PostMapping[m
+[32m+[m[32m    public ResponseEntity<Void> publicarEventoDePrueba(@Valid @RequestBody TurnoEventTestRequest request) {[m
+[32m+[m[32m        TurnoEvent evento = new TurnoEvent([m
+[32m+[m[32m                request.turnoId(),[m
+[32m+[m[32m                request.usuarioId(),[m
+[32m+[m[32m                request.numeroTurno(),[m
+[32m+[m[32m                request.especialidad(),[m
+[32m+[m[32m                request.establecimiento(),[m
+[32m+[m[32m                request.fechaHora() != null ? request.fechaHora() : LocalDateTime.now(),[m
+[32m+[m[32m                request.estado(),[m
+[32m+[m[32m                request.tipoEvento()[m
+[32m+[m[32m        );[m
+[32m+[m[32m        eventPublisher.publishEvent(evento);[m
+[32m+[m[32m        return ResponseEntity.accepted().build();[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public record TurnoEventTestRequest([m
+[32m+[m[32m            @NotNull Long turnoId,[m
+[32m+[m[32m            @NotNull Long usuarioId,[m
+[32m+[m[32m            @NotBlank String numeroTurno,[m
+[32m+[m[32m            @NotBlank String especialidad,[m
+[32m+[m[32m            @NotBlank String establecimiento,[m
+[32m+[m[32m            LocalDateTime fechaHora,[m
+[32m+[m[32m            @NotBlank String estado,[m
+[32m+[m[32m            @NotNull TipoEventoTurno tipoEvento[m
+[32m+[m[32m    ) {[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/entity/Notificacion.java b/src/main/java/com/turnoya/turnoyabackend/entity/Notificacion.java[m
+[1mindex 30080a5..848f570 100644[m
+[1m--- a/src/main/java/com/turnoya/turnoyabackend/entity/Notificacion.java[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/entity/Notificacion.java[m
+[36m@@ -1,4 +1,56 @@[m
+ package com.turnoya.turnoyabackend.entity;[m
+ [m
+[32m+[m[32mimport jakarta.persistence.Column;[m
+[32m+[m[32mimport jakarta.persistence.Entity;[m
+[32m+[m[32mimport jakarta.persistence.FetchType;[m
+[32m+[m[32mimport jakarta.persistence.GeneratedValue;[m
+[32m+[m[32mimport jakarta.persistence.GenerationType;[m
+[32m+[m[32mimport jakarta.persistence.Id;[m
+[32m+[m[32mimport jakarta.persistence.JoinColumn;[m
+[32m+[m[32mimport jakarta.persistence.ManyToOne;[m
+[32m+[m[32mimport jakarta.persistence.Table;[m
+[32m+[m[32mimport lombok.AllArgsConstructor;[m
+[32m+[m[32mimport lombok.Builder;[m
+[32m+[m[32mimport lombok.Getter;[m
+[32m+[m[32mimport lombok.NoArgsConstructor;[m
+[32m+[m[32mimport lombok.Setter;[m
+[32m+[m
+[32m+[m[32mimport java.time.LocalDateTime;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Registro histórico de una notificación enviada a un usuario (correo, SMS o[m
+[32m+[m[32m * push). El {@code EmailService} crea una fila aquí cada vez que un envío de[m
+[32m+[m[32m * correo se completa con éxito.[m
+[32m+[m[32m * <p>[m
+[32m+[m[32m * Campos tal cual los definió Yadir en la propuesta técnica: {@code id},[m
+[32m+[m[32m * {@code usuario}, {@code mensaje}, {@code tipo}, {@code fechaEnvio}. No se[m
+[32m+[m[32m * agregaron campos adicionales a propósito, para no romper el diseño ya[m
+[32m+[m[32m * acordado por el equipo.[m
+[32m+[m[32m */[m
+[32m+[m[32m@Entity[m
+[32m+[m[32m@Table(name = "notificaciones")[m
+[32m+[m[32m@Getter[m
+[32m+[m[32m@Setter[m
+[32m+[m[32m@NoArgsConstructor[m
+[32m+[m[32m@AllArgsConstructor[m
+[32m+[m[32m@Builder[m
+ public class Notificacion {[m
+[32m+[m
+[32m+[m[32m    @Id[m
+[32m+[m[32m    @GeneratedValue(strategy = GenerationType.IDENTITY)[m
+[32m+[m[32m    private Long id;[m
+[32m+[m
+[32m+[m[32m    @ManyToOne(fetch = FetchType.LAZY)[m
+[32m+[m[32m    @JoinColumn(name = "usuario_id", nullable = false)[m
+[32m+[m[32m    private Usuario usuario;[m
+[32m+[m
+[32m+[m[32m    @Column(nullable = false, length = 1000)[m
+[32m+[m[32m    private String mensaje;[m
+[32m+[m
+[32m+[m[32m    /** Ej: "EMAIL", "SMS", "PUSH". Se deja como texto libre para no acoplarse a un enum aún no acordado por el equipo. */[m
+[32m+[m[32m    @Column(nullable = false)[m
+[32m+[m[32m    private String tipo;[m
+[32m+[m
+[32m+[m[32m    @Column(name = "fecha_envio", nullable = false)[m
+[32m+[m[32m    private LocalDateTime fechaEnvio;[m
+ }[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/entity/RolUsuario.java b/src/main/java/com/turnoya/turnoyabackend/entity/RolUsuario.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..36d7f4b[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/entity/RolUsuario.java[m
+[36m@@ -0,0 +1,11 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.entity;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Roles de acceso de la propuesta (sección "Autenticación & Roles"):[m
+[32m+[m[32m * Paciente, Médico o Administrador de establecimiento.[m
+[32m+[m[32m */[m
+[32m+[m[32mpublic enum RolUsuario {[m
+[32m+[m[32m    PACIENTE,[m
+[32m+[m[32m    MEDICO,[m
+[32m+[m[32m    ADMINISTRADOR[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/entity/Usuario.java b/src/main/java/com/turnoya/turnoyabackend/entity/Usuario.java[m
+[1mindex 27e663f..679daf0 100644[m
+[1m--- a/src/main/java/com/turnoya/turnoyabackend/entity/Usuario.java[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/entity/Usuario.java[m
+[36m@@ -1,4 +1,57 @@[m
+ package com.turnoya.turnoyabackend.entity;[m
+ [m
+[32m+[m[32mimport jakarta.persistence.Column;[m
+[32m+[m[32mimport jakarta.persistence.Entity;[m
+[32m+[m[32mimport jakarta.persistence.EnumType;[m
+[32m+[m[32mimport jakarta.persistence.Enumerated;[m
+[32m+[m[32mimport jakarta.persistence.GeneratedValue;[m
+[32m+[m[32mimport jakarta.persistence.GenerationType;[m
+[32m+[m[32mimport jakarta.persistence.Id;[m
+[32m+[m[32mimport jakarta.persistence.Table;[m
+[32m+[m[32mimport lombok.AllArgsConstructor;[m
+[32m+[m[32mimport lombok.Builder;[m
+[32m+[m[32mimport lombok.Getter;[m
+[32m+[m[32mimport lombok.NoArgsConstructor;[m
+[32m+[m[32mimport lombok.Setter;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Entidad base de usuario (sección 3 de la propuesta: Usuario).[m
+[32m+[m[32m * <p>[m
+[32m+[m[32m * NOTA PARA EL EQUIPO: este archivo llegó como una clase vacía; como los[m
+[32m+[m[32m * módulos de errores/eventos/correo (rama {@code feature/brid-errores})[m
+[32m+[m[32m * necesitan la relación {@code Notificacion -> Usuario} para compilar, se[m
+[32m+[m[32m * completó aquí con únicamente los campos que ya están definidos en la[m
+[32m+[m[32m * propuesta técnica (sección "Estructura de Datos"). Si Backend & Database[m
+[32m+[m[32m * Architecture ya tiene su propia versión más avanzada (validaciones,[m
+[32m+[m[32m * relaciones con Paciente/Médico, etc.), esta clase debe reconciliarse/[m
+[32m+[m[32m * reemplazarse con esa antes de mergear a {@code develop}; no se agregó[m
+[32m+[m[32m * ningún campo fuera de los ya acordados.[m
+[32m+[m[32m */[m
+[32m+[m[32m@Entity[m
+[32m+[m[32m@Table(name = "usuarios")[m
+[32m+[m[32m@Getter[m
+[32m+[m[32m@Setter[m
+[32m+[m[32m@NoArgsConstructor[m
+[32m+[m[32m@AllArgsConstructor[m
+[32m+[m[32m@Builder[m
+ public class Usuario {[m
+[32m+[m
+[32m+[m[32m    @Id[m
+[32m+[m[32m    @GeneratedValue(strategy = GenerationType.IDENTITY)[m
+[32m+[m[32m    private Long id;[m
+[32m+[m
+[32m+[m[32m    @Column(nullable = false)[m
+[32m+[m[32m    private String nombre;[m
+[32m+[m
+[32m+[m[32m    @Column(nullable = false, unique = true)[m
+[32m+[m[32m    private String email;[m
+[32m+[m
+[32m+[m[32m    @Column(name = "password_hash", nullable = false)[m
+[32m+[m[32m    private String passwordHash;[m
+[32m+[m
+[32m+[m[32m    private String telefono;[m
+[32m+[m
+[32m+[m[32m    @Enumerated(EnumType.STRING)[m
+[32m+[m[32m    @Column(nullable = false)[m
+[32m+[m[32m    private RolUsuario rol;[m
+ }[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/event/TipoEventoTurno.java b/src/main/java/com/turnoya/turnoyabackend/event/TipoEventoTurno.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..3dea3cd[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/event/TipoEventoTurno.java[m
+[36m@@ -0,0 +1,11 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.event;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Indica qué disparó el evento de turno: su creación o un cambio posterior[m
+[32m+[m[32m * de estado (por ejemplo, cuando el triage reordena la cola y el turno pasa[m
+[32m+[m[32m * a ser el siguiente en atenderse).[m
+[32m+[m[32m */[m
+[32m+[m[32mpublic enum TipoEventoTurno {[m
+[32m+[m[32m    CREACION,[m
+[32m+[m[32m    CAMBIO_ESTADO[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/event/TurnoEvent.java b/src/main/java/com/turnoya/turnoyabackend/event/TurnoEvent.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..720e444[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/event/TurnoEvent.java[m
+[36m@@ -0,0 +1,87 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.event;[m
+[32m+[m
+[32m+[m[32mimport java.time.LocalDateTime;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Evento de dominio que representa la creación o el cambio de estado de un[m
+[32m+[m[32m * {@code Turno}.[m
+[32m+[m[32m * <p>[m
+[32m+[m[32m * <b>Cómo lo usan los demás módulos:</b> cuando el servicio de turnos (módulo[m
+[32m+[m[32m * de Backend & Database / Async del equipo) crea o actualiza un turno, debe[m
+[32m+[m[32m * publicar este evento así:[m
+[32m+[m[32m * <pre>{@code[m
+[32m+[m[32m * eventPublisher.publishEvent(new TurnoEvent([m
+[32m+[m[32m *         turno.getId(),[m
+[32m+[m[32m *         turno.getPaciente().getUsuario().getId(),[m
+[32m+[m[32m *         String.valueOf(turno.getId()),      // o el código de turno que definan[m
+[32m+[m[32m *         turno.getEspecialidad().getNombre(),[m
+[32m+[m[32m *         turno.getEstablecimiento().getNombre(),[m
+[32m+[m[32m *         turno.getFechaHora(),[m
+[32m+[m[32m *         turno.getEstado().name(),[m
+[32m+[m[32m *         TipoEventoTurno.CREACION[m
+[32m+[m[32m * ));[m
+[32m+[m[32m * }</pre>[m
+[32m+[m[32m * A propósito NO viaja la entidad JPA {@code Turno} completa dentro del evento:[m
+[32m+[m[32m * como el listener se ejecuta de forma asíncrona (en otro hilo, fuera de la[m
+[32m+[m[32m * transacción original), acceder a relaciones lazy de una entidad ya[m
+[32m+[m[32m * "despegada" del contexto de persistencia lanzaría[m
+[32m+[m[32m * {@code LazyInitializationException}. Por eso el evento viaja con datos ya[m
+[32m+[m[32m * resueltos (tipos simples), que es la práctica recomendada para eventos[m
+[32m+[m[32m * asíncronos con JPA.[m
+[32m+[m[32m */[m
+[32m+[m[32mpublic class TurnoEvent {[m
+[32m+[m
+[32m+[m[32m    private final Long turnoId;[m
+[32m+[m[32m    private final Long usuarioId;[m
+[32m+[m[32m    private final String numeroTurno;[m
+[32m+[m[32m    private final String especialidad;[m
+[32m+[m[32m    private final String establecimiento;[m
+[32m+[m[32m    private final LocalDateTime fechaHora;[m
+[32m+[m[32m    private final String estado;[m
+[32m+[m[32m    private final TipoEventoTurno tipoEvento;[m
+[32m+[m
+[32m+[m[32m    public TurnoEvent(Long turnoId, Long usuarioId, String numeroTurno, String especialidad,[m
+[32m+[m[32m                       String establecimiento, LocalDateTime fechaHora, String estado,[m
+[32m+[m[32m                       TipoEventoTurno tipoEvento) {[m
+[32m+[m[32m        this.turnoId = turnoId;[m
+[32m+[m[32m        this.usuarioId = usuarioId;[m
+[32m+[m[32m        this.numeroTurno = numeroTurno;[m
+[32m+[m[32m        this.especialidad = especialidad;[m
+[32m+[m[32m        this.establecimiento = establecimiento;[m
+[32m+[m[32m        this.fechaHora = fechaHora;[m
+[32m+[m[32m        this.estado = estado;[m
+[32m+[m[32m        this.tipoEvento = tipoEvento;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public Long getTurnoId() {[m
+[32m+[m[32m        return turnoId;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public Long getUsuarioId() {[m
+[32m+[m[32m        return usuarioId;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public String getNumeroTurno() {[m
+[32m+[m[32m        return numeroTurno;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public String getEspecialidad() {[m
+[32m+[m[32m        return especialidad;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public String getEstablecimiento() {[m
+[32m+[m[32m        return establecimiento;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public LocalDateTime getFechaHora() {[m
+[32m+[m[32m        return fechaHora;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public String getEstado() {[m
+[32m+[m[32m        return estado;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    public TipoEventoTurno getTipoEvento() {[m
+[32m+[m[32m        return tipoEvento;[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/event/TurnoEventListener.java b/src/main/java/com/turnoya/turnoyabackend/event/TurnoEventListener.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..4dbe35e[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/event/TurnoEventListener.java[m
+[36m@@ -0,0 +1,54 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.event;[m
+[32m+[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.config.AsyncConfig;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.Usuario;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.exception.NotificationFailedException;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.exception.ResourceNotFoundException;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.repository.UsuarioRepository;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.service.EmailService;[m
+[32m+[m[32mimport org.slf4j.Logger;[m
+[32m+[m[32mimport org.slf4j.LoggerFactory;[m
+[32m+[m[32mimport org.springframework.context.event.EventListener;[m
+[32m+[m[32mimport org.springframework.scheduling.annotation.Async;[m
+[32m+[m[32mimport org.springframework.stereotype.Component;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Escucha los {@link TurnoEvent} publicados cuando un turno se crea o cambia[m
+[32m+[m[32m * de estado, y dispara el envío de la notificación por correo en segundo[m
+[32m+[m[32m * plano (fuera del hilo de la petición HTTP original), usando el executor[m
+[32m+[m[32m * configurado en {@link AsyncConfig}.[m
+[32m+[m[32m */[m
+[32m+[m[32m@Component[m
+[32m+[m[32mpublic class TurnoEventListener {[m
+[32m+[m
+[32m+[m[32m    private static final Logger log = LoggerFactory.getLogger(TurnoEventListener.class);[m
+[32m+[m
+[32m+[m[32m    private final UsuarioRepository usuarioRepository;[m
+[32m+[m[32m    private final EmailService emailService;[m
+[32m+[m
+[32m+[m[32m    public TurnoEventListener(UsuarioRepository usuarioRepository, EmailService emailService) {[m
+[32m+[m[32m        this.usuarioRepository = usuarioRepository;[m
+[32m+[m[32m        this.emailService = emailService;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @Async(AsyncConfig.TASK_EXECUTOR_BEAN)[m
+[32m+[m[32m    @EventListener[m
+[32m+[m[32m    public void onTurnoEvent(TurnoEvent evento) {[m
+[32m+[m[32m        log.debug("Procesando evento de turno {} (tipo={}) en el hilo {}",[m
+[32m+[m[32m                evento.getTurnoId(), evento.getTipoEvento(), Thread.currentThread().getName());[m
+[32m+[m
+[32m+[m[32m        Usuario paciente = usuarioRepository.findById(evento.getUsuarioId())[m
+[32m+[m[32m                .orElseThrow(() -> new ResourceNotFoundException([m
+[32m+[m[32m                        "No se encontró el usuario con id " + evento.getUsuarioId() + " para notificar el turno"));[m
+[32m+[m
+[32m+[m[32m        try {[m
+[32m+[m[32m            emailService.enviarNotificacionTurno(paciente, evento);[m
+[32m+[m[32m        } catch (NotificationFailedException ex) {[m
+[32m+[m[32m            // No relanzamos: esto corre en un hilo async y el flujo principal[m
+[32m+[m[32m            // (creación/actualización del turno) ya respondió al cliente.[m
+[32m+[m[32m            // Solo dejamos constancia en logs para que DevOps/monitoreo lo detecte.[m
+[32m+[m[32m            log.error("Falló el envío de notificación para el turno {}: {}",[m
+[32m+[m[32m                    evento.getTurnoId(), ex.getMessage(), ex);[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/repository/NotificacionRepository.java b/src/main/java/com/turnoya/turnoyabackend/repository/NotificacionRepository.java[m
+[1mindex c63f532..72da382 100644[m
+[1m--- a/src/main/java/com/turnoya/turnoyabackend/repository/NotificacionRepository.java[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/repository/NotificacionRepository.java[m
+[36m@@ -1,4 +1,11 @@[m
+ package com.turnoya.turnoyabackend.repository;[m
+ [m
+[31m-public interface NotificacionRepository {[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.Notificacion;[m
+[32m+[m[32mimport org.springframework.data.jpa.repository.JpaRepository;[m
+[32m+[m
+[32m+[m[32mimport java.util.List;[m
+[32m+[m
+[32m+[m[32mpublic interface NotificacionRepository extends JpaRepository<Notificacion, Long> {[m
+[32m+[m
+[32m+[m[32m    List<Notificacion> findByUsuarioIdOrderByFechaEnvioDesc(Long usuarioId);[m
+ }[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/repository/UsuarioRepository.java b/src/main/java/com/turnoya/turnoyabackend/repository/UsuarioRepository.java[m
+[1mindex 38000db..1b5bb1d 100644[m
+[1m--- a/src/main/java/com/turnoya/turnoyabackend/repository/UsuarioRepository.java[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/repository/UsuarioRepository.java[m
+[36m@@ -1,4 +1,11 @@[m
+ package com.turnoya.turnoyabackend.repository;[m
+ [m
+[31m-public interface UsuarioRepository {[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.Usuario;[m
+[32m+[m[32mimport org.springframework.data.jpa.repository.JpaRepository;[m
+[32m+[m
+[32m+[m[32mimport java.util.Optional;[m
+[32m+[m
+[32m+[m[32mpublic interface UsuarioRepository extends JpaRepository<Usuario, Long> {[m
+[32m+[m
+[32m+[m[32m    Optional<Usuario> findByEmail(String email);[m
+ }[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/service/EmailService.java b/src/main/java/com/turnoya/turnoyabackend/service/EmailService.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..1608096[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/service/EmailService.java[m
+[36m@@ -0,0 +1,22 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.service;[m
+[32m+[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.Usuario;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.event.TurnoEvent;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Servicio responsable de notificar por correo electrónico a un paciente[m
+[32m+[m[32m * sobre su turno (creación o cambio de estado), usando una plantilla HTML, y[m
+[32m+[m[32m * de registrar el envío exitoso en {@code Notificacion}.[m
+[32m+[m[32m */[m
+[32m+[m[32mpublic interface EmailService {[m
+[32m+[m
+[32m+[m[32m    /**[m
+[32m+[m[32m     * Renderiza la plantilla HTML de notificación de turno, envía el correo[m
+[32m+[m[32m     * al paciente y, si el envío es exitoso, registra una {@code Notificacion}.[m
+[32m+[m[32m     *[m
+[32m+[m[32m     * @param paciente usuario destinatario (ya resuelto desde la base de datos)[m
+[32m+[m[32m     * @param evento   datos del turno que originó la notificación[m
+[32m+[m[32m     * @throws com.turnoya.turnoyabackend.exception.NotificationFailedException si el envío falla[m
+[32m+[m[32m     */[m
+[32m+[m[32m    void enviarNotificacionTurno(Usuario paciente, TurnoEvent evento);[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/java/com/turnoya/turnoyabackend/service/impl/EmailServiceImpl.java b/src/main/java/com/turnoya/turnoyabackend/service/impl/EmailServiceImpl.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..a1e5ec3[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/java/com/turnoya/turnoyabackend/service/impl/EmailServiceImpl.java[m
+[36m@@ -0,0 +1,102 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.service.impl;[m
+[32m+[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.Notificacion;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.Usuario;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.event.TurnoEvent;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.exception.NotificationFailedException;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.repository.NotificacionRepository;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.service.EmailService;[m
+[32m+[m[32mimport jakarta.mail.MessagingException;[m
+[32m+[m[32mimport jakarta.mail.internet.MimeMessage;[m
+[32m+[m[32mimport org.slf4j.Logger;[m
+[32m+[m[32mimport org.slf4j.LoggerFactory;[m
+[32m+[m[32mimport org.springframework.beans.factory.annotation.Value;[m
+[32m+[m[32mimport org.springframework.mail.MailException;[m
+[32m+[m[32mimport org.springframework.mail.javamail.JavaMailSender;[m
+[32m+[m[32mimport org.springframework.mail.javamail.MimeMessageHelper;[m
+[32m+[m[32mimport org.springframework.stereotype.Service;[m
+[32m+[m[32mimport org.thymeleaf.TemplateEngine;[m
+[32m+[m[32mimport org.thymeleaf.context.Context;[m
+[32m+[m
+[32m+[m[32mimport java.time.LocalDateTime;[m
+[32m+[m[32mimport java.time.format.DateTimeFormatter;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Implementación de {@link EmailService} basada en {@link JavaMailSender} +[m
+[32m+[m[32m * Thymeleaf (plantilla HTML en {@code templates/email/turno-notificacion.html}).[m
+[32m+[m[32m * <p>[m
+[32m+[m[32m * Cada envío exitoso se registra automáticamente en {@code Notificacion}[m
+[32m+[m[32m * (tal como pide la tarea), y cualquier falla de envío se traduce en[m
+[32m+[m[32m * {@link NotificationFailedException} para que, si se invoca desde un[m
+[32m+[m[32m * contexto síncrono, el {@code GlobalExceptionHandler} pueda devolver un[m
+[32m+[m[32m * HTTP 500 consistente; si se invoca desde el listener asíncrono, este la[m
+[32m+[m[32m * captura y solo la registra en logs (ver {@code TurnoEventListener}).[m
+[32m+[m[32m */[m
+[32m+[m[32m@Service[m
+[32m+[m[32mpublic class EmailServiceImpl implements EmailService {[m
+[32m+[m
+[32m+[m[32m    private static final Logger log = LoggerFactory.getLogger(EmailServiceImpl.class);[m
+[32m+[m[32m    private static final String NOMBRE_PLANTILLA = "email/turno-notificacion";[m
+[32m+[m[32m    private static final String TIPO_NOTIFICACION_EMAIL = "EMAIL";[m
+[32m+[m[32m    private static final DateTimeFormatter FORMATO_FECHA = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");[m
+[32m+[m
+[32m+[m[32m    private final JavaMailSender mailSender;[m
+[32m+[m[32m    private final TemplateEngine templateEngine;[m
+[32m+[m[32m    private final NotificacionRepository notificacionRepository;[m
+[32m+[m
+[32m+[m[32m    @Value("${app.mail.from:no-reply@turnoya.com}")[m
+[32m+[m[32m    private String remitente;[m
+[32m+[m
+[32m+[m[32m    public EmailServiceImpl(JavaMailSender mailSender,[m
+[32m+[m[32m                             TemplateEngine templateEngine,[m
+[32m+[m[32m                             NotificacionRepository notificacionRepository) {[m
+[32m+[m[32m        this.mailSender = mailSender;[m
+[32m+[m[32m        this.templateEngine = templateEngine;[m
+[32m+[m[32m        this.notificacionRepository = notificacionRepository;[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @Override[m
+[32m+[m[32m    public void enviarNotificacionTurno(Usuario paciente, TurnoEvent evento) {[m
+[32m+[m[32m        String asunto = "TurnoYa - Turno N° " + evento.getNumeroTurno();[m
+[32m+[m[32m        String contenidoHtml = renderizarPlantilla(paciente, evento);[m
+[32m+[m
+[32m+[m[32m        try {[m
+[32m+[m[32m            MimeMessage mimeMessage = mailSender.createMimeMessage();[m
+[32m+[m[32m            MimeMessageHelper helper = new MimeMessageHelper(mimeMessage, false, "UTF-8");[m
+[32m+[m[32m            helper.setTo(paciente.getEmail());[m
+[32m+[m[32m            helper.setFrom(remitente);[m
+[32m+[m[32m            helper.setSubject(asunto);[m
+[32m+[m[32m            helper.setText(contenidoHtml, true);[m
+[32m+[m
+[32m+[m[32m            mailSender.send(mimeMessage);[m
+[32m+[m[32m            log.info("Correo de notificación de turno enviado a {}", paciente.getEmail());[m
+[32m+[m
+[32m+[m[32m            registrarNotificacionExitosa(paciente, asunto);[m
+[32m+[m[32m        } catch (MessagingException | MailException ex) {[m
+[32m+[m[32m            throw new NotificationFailedException([m
+[32m+[m[32m                    "No se pudo enviar el correo de notificación de turno al paciente " + paciente.getEmail(), ex);[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    private String renderizarPlantilla(Usuario paciente, TurnoEvent evento) {[m
+[32m+[m[32m        Context context = new Context();[m
+[32m+[m[32m        context.setVariable("nombrePaciente", paciente.getNombre());[m
+[32m+[m[32m        context.setVariable("numeroTurno", evento.getNumeroTurno());[m
+[32m+[m[32m        context.setVariable("especialidad", evento.getEspecialidad());[m
+[32m+[m[32m        context.setVariable("establecimiento", evento.getEstablecimiento());[m
+[32m+[m[32m        context.setVariable("fechaHora", evento.getFechaHora() != null ? evento.getFechaHora().format(FORMATO_FECHA) : "");[m
+[32m+[m[32m        context.setVariable("estado", evento.getEstado());[m
+[32m+[m[32m        context.setVariable("tipoEvento", evento.getTipoEvento());[m
+[32m+[m[32m        return templateEngine.process(NOMBRE_PLANTILLA, context);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    private void registrarNotificacionExitosa(Usuario paciente, String mensaje) {[m
+[32m+[m[32m        Notificacion notificacion = Notificacion.builder()[m
+[32m+[m[32m                .usuario(paciente)[m
+[32m+[m[32m                .mensaje(mensaje)[m
+[32m+[m[32m                .tipo(TIPO_NOTIFICACION_EMAIL)[m
+[32m+[m[32m                .fechaEnvio(LocalDateTime.now())[m
+[32m+[m[32m                .build();[m
+[32m+[m[32m        notificacionRepository.save(notificacion);[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/main/resources/application.properties b/src/main/resources/application.properties[m
+[1mindex 630926b..5556887 100644[m
+[1m--- a/src/main/resources/application.properties[m
+[1m+++ b/src/main/resources/application.properties[m
+[36m@@ -1 +1,20 @@[m
+ spring.application.name=turnoya-backend[m
+[32m+[m
+[32m+[m[32m# --- Correo (EmailService) ---[m
+[32m+[m[32m# Configura estas variables de entorno en tu máquina/IntelliJ (Run Configuration > Environment variables),[m
+[32m+[m[32m# NUNCA subas usuario/clave reales al repositorio.[m
+[32m+[m[32m# Para Gmail se recomienda usar una "contraseña de aplicación" (App Password), no la clave normal de la cuenta.[m
+[32m+[m[32mspring.mail.host=${MAIL_HOST:smtp.gmail.com}[m
+[32m+[m[32mspring.mail.port=${MAIL_PORT:587}[m
+[32m+[m[32mspring.mail.username=${MAIL_USERNAME:}[m
+[32m+[m[32mspring.mail.password=${MAIL_PASSWORD:}[m
+[32m+[m[32mspring.mail.properties.mail.smtp.auth=true[m
+[32m+[m[32mspring.mail.properties.mail.smtp.starttls.enable=true[m
+[32m+[m[32mspring.mail.properties.mail.smtp.connectiontimeout=5000[m
+[32m+[m[32mspring.mail.properties.mail.smtp.timeout=5000[m
+[32m+[m
+[32m+[m[32mapp.mail.from=${MAIL_FROM:no-reply@turnoya.com}[m
+[32m+[m
+[32m+[m[32m# Thymeleaf: los templates de correo son estáticos (no dependen de request HTTP), evitamos el cache[m
+[32m+[m[32m# en desarrollo para poder iterar el HTML sin reiniciar la app.[m
+[32m+[m[32mspring.thymeleaf.cache=false[m
+[1mdiff --git a/src/main/resources/templates/email/turno-notificacion.html b/src/main/resources/templates/email/turno-notificacion.html[m
+[1mnew file mode 100644[m
+[1mindex 0000000..0adfc77[m
+[1m--- /dev/null[m
+[1m+++ b/src/main/resources/templates/email/turno-notificacion.html[m
+[36m@@ -0,0 +1,81 @@[m
+[32m+[m[32m<!DOCTYPE html>[m
+[32m+[m[32m<html xmlns:th="http://www.thymeleaf.org">[m
+[32m+[m[32m<head>[m
+[32m+[m[32m    <meta charset="UTF-8"/>[m
+[32m+[m[32m    <title>Notificación de turno - TurnoYa</title>[m
+[32m+[m[32m</head>[m
+[32m+[m[32m<body style="margin:0; padding:0; background-color:#f2f4f7; font-family: Arial, Helvetica, sans-serif;">[m
+[32m+[m[32m<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f2f4f7; padding:24px 0;">[m
+[32m+[m[32m    <tr>[m
+[32m+[m[32m        <td align="center">[m
+[32m+[m[32m            <table role="presentation" width="480" cellpadding="0" cellspacing="0"[m
+[32m+[m[32m                   style="background-color:#ffffff; border-radius:8px; overflow:hidden; box-shadow:0 1px 4px rgba(0,0,0,0.08);">[m
+[32m+[m[32m                <tr>[m
+[32m+[m[32m                    <td style="background-color:#1565c0; padding:20px 24px;">[m
+[32m+[m[32m                        <span style="color:#ffffff; font-size:20px; font-weight:bold;">TurnoYa</span>[m
+[32m+[m[32m                    </td>[m
+[32m+[m[32m                </tr>[m
+[32m+[m[32m                <tr>[m
+[32m+[m[32m                    <td style="padding:24px;">[m
+[32m+[m[32m                        <p style="font-size:16px; color:#212121; margin:0 0 12px 0;">[m
+[32m+[m[32m                            Hola <strong th:text="${nombrePaciente}">Paciente</strong>,[m
+[32m+[m[32m                        </p>[m
+[32m+[m
+[32m+[m[32m                        <p style="font-size:15px; color:#424242; margin:0 0 20px 0;" th:if="${tipoEvento?.name() == 'CREACION'}">[m
+[32m+[m[32m                            Tu turno ha sido registrado correctamente. Estos son los detalles:[m
+[32m+[m[32m                        </p>[m
+[32m+[m[32m                        <p style="font-size:15px; color:#424242; margin:0 0 20px 0;" th:unless="${tipoEvento?.name() == 'CREACION'}">[m
+[32m+[m[32m                            El estado de tu turno se ha actualizado. Estos son los detalles:[m
+[32m+[m[32m                        </p>[m
+[32m+[m
+[32m+[m[32m                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0"[m
+[32m+[m[32m                               style="border:1px solid #e0e0e0; border-radius:6px; margin-bottom:20px;">[m
+[32m+[m[32m                            <tr>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:13px; color:#757575;">Número de turno</td>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:16px; color:#1565c0; font-weight:bold; text-align:right;"[m
+[32m+[m[32m                                    th:text="${numeroTurno}">000123[m
+[32m+[m[32m                                </td>[m
+[32m+[m[32m                            </tr>[m
+[32m+[m[32m                            <tr>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:13px; color:#757575; border-top:1px solid #e0e0e0;">Especialidad</td>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:14px; color:#212121; text-align:right; border-top:1px solid #e0e0e0;"[m
+[32m+[m[32m                                    th:text="${especialidad}">Medicina General[m
+[32m+[m[32m                                </td>[m
+[32m+[m[32m                            </tr>[m
+[32m+[m[32m                            <tr>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:13px; color:#757575; border-top:1px solid #e0e0e0;">Establecimiento</td>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:14px; color:#212121; text-align:right; border-top:1px solid #e0e0e0;"[m
+[32m+[m[32m                                    th:text="${establecimiento}">Posta San Martín[m
+[32m+[m[32m                                </td>[m
+[32m+[m[32m                            </tr>[m
+[32m+[m[32m                            <tr>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:13px; color:#757575; border-top:1px solid #e0e0e0;">Fecha y hora</td>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:14px; color:#212121; text-align:right; border-top:1px solid #e0e0e0;"[m
+[32m+[m[32m                                    th:text="${fechaHora}">24/09/2026 10:30[m
+[32m+[m[32m                                </td>[m
+[32m+[m[32m                            </tr>[m
+[32m+[m[32m                            <tr>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:13px; color:#757575; border-top:1px solid #e0e0e0;">Estado</td>[m
+[32m+[m[32m                                <td style="padding:12px 16px; font-size:14px; color:#212121; text-align:right; border-top:1px solid #e0e0e0;"[m
+[32m+[m[32m                                    th:text="${estado}">Pendiente[m
+[32m+[m[32m                                </td>[m
+[32m+[m[32m                            </tr>[m
+[32m+[m[32m                        </table>[m
+[32m+[m
+[32m+[m[32m                        <p style="font-size:13px; color:#9e9e9e; margin:0;">[m
+[32m+[m[32m                            Te avisaremos nuevamente cuando tu turno esté por ser atendido. Si no reservaste este[m
+[32m+[m[32m                            turno, por favor ignora este correo.[m
+[32m+[m[32m                        </p>[m
+[32m+[m[32m                    </td>[m
+[32m+[m[32m                </tr>[m
+[32m+[m[32m                <tr>[m
+[32m+[m[32m                    <td style="background-color:#fafafa; padding:16px 24px; text-align:center;">[m
+[32m+[m[32m                        <span style="font-size:12px; color:#9e9e9e;">TurnoYa &middot; Gestión de turnos y triage para postas y centros de salud</span>[m
+[32m+[m[32m                    </td>[m
+[32m+[m[32m                </tr>[m
+[32m+[m[32m            </table>[m
+[32m+[m[32m        </td>[m
+[32m+[m[32m    </tr>[m
+[32m+[m[32m</table>[m
+[32m+[m[32m</body>[m
+[32m+[m[32m</html>[m
+[1mdiff --git a/src/test/java/com/turnoya/turnoyabackend/event/TurnoEventListenerTest.java b/src/test/java/com/turnoya/turnoyabackend/event/TurnoEventListenerTest.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..01e052d[m
+[1m--- /dev/null[m
+[1m+++ b/src/test/java/com/turnoya/turnoyabackend/event/TurnoEventListenerTest.java[m
+[36m@@ -0,0 +1,107 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.event;[m
+[32m+[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.RolUsuario;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.entity.Usuario;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.exception.NotificationFailedException;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.exception.ResourceNotFoundException;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.repository.UsuarioRepository;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.service.EmailService;[m
+[32m+[m[32mimport org.junit.jupiter.api.Test;[m
+[32m+[m
+[32m+[m[32mimport java.lang.reflect.InvocationHandler;[m
+[32m+[m[32mimport java.lang.reflect.Method;[m
+[32m+[m[32mimport java.lang.reflect.Proxy;[m
+[32m+[m[32mimport java.time.LocalDateTime;[m
+[32m+[m[32mimport java.util.Optional;[m
+[32m+[m[32mimport java.util.concurrent.atomic.AtomicBoolean;[m
+[32m+[m[32mimport java.util.concurrent.atomic.AtomicInteger;[m
+[32m+[m
+[32m+[m[32mimport static org.junit.jupiter.api.Assertions.assertDoesNotThrow;[m
+[32m+[m[32mimport static org.junit.jupiter.api.Assertions.assertEquals;[m
+[32m+[m[32mimport static org.junit.jupiter.api.Assertions.assertThrows;[m
+[32m+[m
+[32m+[m[32m/**[m
+[32m+[m[32m * Pruebas unitarias de {@link TurnoEventListener} sin levantar contexto de[m
+[32m+[m[32m * Spring: {@code UsuarioRepository} se reemplaza por un proxy dinámico que[m
+[32m+[m[32m * solo implementa {@code findById}, y {@code EmailService} por una[m
+[32m+[m[32m * implementación de prueba mínima. Así evitamos depender de un framework de[m
+[32m+[m[32m * mocks concreto y del datasource real.[m
+[32m+[m[32m */[m
+[32m+[m[32mclass TurnoEventListenerTest {[m
+[32m+[m
+[32m+[m[32m    private final Usuario pacienteDePrueba = Usuario.builder()[m
+[32m+[m[32m            .id(1L)[m
+[32m+[m[32m            .nombre("Juana Pérez")[m
+[32m+[m[32m            .email("juana@example.com")[m
+[32m+[m[32m            .passwordHash("hash")[m
+[32m+[m[32m            .rol(RolUsuario.PACIENTE)[m
+[32m+[m[32m            .build();[m
+[32m+[m
+[32m+[m[32m    @Test[m
+[32m+[m[32m    void notificaAlPacienteCuandoElUsuarioExiste() {[m
+[32m+[m[32m        AtomicInteger llamadasEmail = new AtomicInteger();[m
+[32m+[m[32m        UsuarioRepository usuarioRepository = repositorioQueDevuelve(Optional.of(pacienteDePrueba));[m
+[32m+[m[32m        EmailService emailService = (paciente, evento) -> llamadasEmail.incrementAndGet();[m
+[32m+[m
+[32m+[m[32m        TurnoEventListener listener = new TurnoEventListener(usuarioRepository, emailService);[m
+[32m+[m
+[32m+[m[32m        assertDoesNotThrow(() -> listener.onTurnoEvent(eventoDePrueba()));[m
+[32m+[m[32m        assertEquals(1, llamadasEmail.get());[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @Test[m
+[32m+[m[32m    void lanzaResourceNotFoundExceptionSiElUsuarioNoExiste() {[m
+[32m+[m[32m        UsuarioRepository usuarioRepository = repositorioQueDevuelve(Optional.empty());[m
+[32m+[m[32m        EmailService emailService = (paciente, evento) -> {[m
+[32m+[m[32m            throw new AssertionError("No debería llamarse a EmailService si el usuario no existe");[m
+[32m+[m[32m        };[m
+[32m+[m
+[32m+[m[32m        TurnoEventListener listener = new TurnoEventListener(usuarioRepository, emailService);[m
+[32m+[m
+[32m+[m[32m        assertThrows(ResourceNotFoundException.class, () -> listener.onTurnoEvent(eventoDePrueba()));[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @Test[m
+[32m+[m[32m    void noPropagaLaExcepcionSiFallaElEnvioDeCorreo() {[m
+[32m+[m[32m        AtomicBoolean seIntentoEnviar = new AtomicBoolean(false);[m
+[32m+[m[32m        UsuarioRepository usuarioRepository = repositorioQueDevuelve(Optional.of(pacienteDePrueba));[m
+[32m+[m[32m        EmailService emailService = (paciente, evento) -> {[m
+[32m+[m[32m            seIntentoEnviar.set(true);[m
+[32m+[m[32m            throw new NotificationFailedException("SMTP caído");[m
+[32m+[m[32m        };[m
+[32m+[m
+[32m+[m[32m        TurnoEventListener listener = new TurnoEventListener(usuarioRepository, emailService);[m
+[32m+[m
+[32m+[m[32m        // El listener corre en un hilo async: no debe propagar la excepción, solo loguearla.[m
+[32m+[m[32m        assertDoesNotThrow(() -> listener.onTurnoEvent(eventoDePrueba()));[m
+[32m+[m[32m        assertEquals(true, seIntentoEnviar.get());[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    private TurnoEvent eventoDePrueba() {[m
+[32m+[m[32m        return new TurnoEvent([m
+[32m+[m[32m                10L,[m
+[32m+[m[32m                pacienteDePrueba.getId(),[m
+[32m+[m[32m                "000123",[m
+[32m+[m[32m                "Medicina General",[m
+[32m+[m[32m                "Posta San Martín",[m
+[32m+[m[32m                LocalDateTime.now(),[m
+[32m+[m[32m                "PENDIENTE",[m
+[32m+[m[32m                TipoEventoTurno.CREACION[m
+[32m+[m[32m        );[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @SuppressWarnings("unchecked")[m
+[32m+[m[32m    private UsuarioRepository repositorioQueDevuelve(Optional<Usuario> resultado) {[m
+[32m+[m[32m        InvocationHandler handler = (proxy, method, args) -> {[m
+[32m+[m[32m            if ("findById".equals(method.getName())) {[m
+[32m+[m[32m                return resultado;[m
+[32m+[m[32m            }[m
+[32m+[m[32m            throw new UnsupportedOperationException([m
+[32m+[m[32m                    "Método no soportado en este repositorio de prueba: " + method.getName());[m
+[32m+[m[32m        };[m
+[32m+[m[32m        return (UsuarioRepository) Proxy.newProxyInstance([m
+[32m+[m[32m                UsuarioRepository.class.getClassLoader(),[m
+[32m+[m[32m                new Class<?>[]{UsuarioRepository.class},[m
+[32m+[m[32m                handler);[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/test/java/com/turnoya/turnoyabackend/exception/handler/GlobalExceptionHandlerTest.java b/src/test/java/com/turnoya/turnoyabackend/exception/handler/GlobalExceptionHandlerTest.java[m
+[1mnew file mode 100644[m
+[1mindex 0000000..ea8a6bd[m
+[1m--- /dev/null[m
+[1m+++ b/src/test/java/com/turnoya/turnoyabackend/exception/handler/GlobalExceptionHandlerTest.java[m
+[36m@@ -0,0 +1,90 @@[m
+[32m+[m[32mpackage com.turnoya.turnoyabackend.exception.handler;[m
+[32m+[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.exception.ResourceNotFoundException;[m
+[32m+[m[32mimport com.turnoya.turnoyabackend.exception.TurnoConflictException;[m
+[32m+[m[32mimport org.junit.jupiter.api.Test;[m
+[32m+[m[32mimport org.springframework.http.HttpStatus;[m
+[32m+[m[32mimport org.springframework.http.ResponseEntity;[m
+[32m+[m[32mimport org.springframework.mock.web.MockHttpServletRequest;[m
+[32m+[m[32mimport org.springframework.validation.BeanPropertyBindingResult;[m
+[32m+[m[32mimport org.springframework.validation.FieldError;[m
+[32m+[m[32mimport org.springframework.web.bind.MethodArgumentNotValidException;[m
+[32m+[m[32mimport org.springframework.web.method.HandlerMethod;[m
+[32m+[m
+[32m+[m[32mimport static org.junit.jupiter.api.Assertions.assertEquals;[m
+[32m+[m[32mimport static org.junit.jupiter.api.Assertions.assertNull;[m
+[32m+[m[32mimport static org.junit.jupiter.api.Assertions.assertNotNull;[m
+[32m+[m
+[32m+[m[32mclass GlobalExceptionHandlerTest {[m
+[32m+[m
+[32m+[m[32m    private final GlobalExceptionHandler handler = new GlobalExceptionHandler();[m
+[32m+[m
+[32m+[m[32m    @Test[m
+[32m+[m[32m    void devuelve404YFormatoEstandarParaResourceNotFoundException() {[m
+[32m+[m[32m        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/turnos/99");[m
+[32m+[m
+[32m+[m[32m        ResponseEntity<ErrorResponse> response =[m
+[32m+[m[32m                handler.handleApiException(new ResourceNotFoundException("No se encontró el turno con id 99"), request);[m
+[32m+[m
+[32m+[m[32m        assertEquals(HttpStatus.NOT_FOUND, response.getStatusCode());[m
+[32m+[m[32m        ErrorResponse body = response.getBody();[m
+[32m+[m[32m        assertNotNull(body);[m
+[32m+[m[32m        assertEquals(404, body.getStatus());[m
+[32m+[m[32m        assertEquals("Not Found", body.getError());[m
+[32m+[m[32m        assertEquals("No se encontró el turno con id 99", body.getMensaje());[m
+[32m+[m[32m        assertEquals("/api/turnos/99", body.getPath());[m
+[32m+[m[32m        assertNotNull(body.getTimestamp());[m
+[32m+[m[32m        assertNull(body.getErrores());[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @Test[m
+[32m+[m[32m    void devuelve409ParaTurnoConflictException() {[m
+[32m+[m[32m        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/turnos");[m
+[32m+[m
+[32m+[m[32m        ResponseEntity<ErrorResponse> response =[m
+[32m+[m[32m                handler.handleApiException(new TurnoConflictException("El médico ya tiene un turno en ese horario"), request);[m
+[32m+[m
+[32m+[m[32m        assertEquals(HttpStatus.CONFLICT, response.getStatusCode());[m
+[32m+[m[32m        assertEquals(409, response.getBody().getStatus());[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @Test[m
+[32m+[m[32m    void devuelve400ConDetalleDeCamposParaErroresDeValidacion() throws NoSuchMethodException {[m
+[32m+[m[32m        MockHttpServletRequest request = new MockHttpServletRequest("POST", "/api/pacientes");[m
+[32m+[m
+[32m+[m[32m        Object target = new Object();[m
+[32m+[m[32m        BeanPropertyBindingResult bindingResult = new BeanPropertyBindingResult(target, "pacienteDTO");[m
+[32m+[m[32m        bindingResult.addError(new FieldError("pacienteDTO", "email", "debe ser un email válido"));[m
+[32m+[m[32m        bindingResult.addError(new FieldError("pacienteDTO", "dni", "no debe estar vacío"));[m
+[32m+[m
+[32m+[m[32m        HandlerMethod handlerMethod = new HandlerMethod(this, "metodoDummy", String.class);[m
+[32m+[m[32m        MethodArgumentNotValidException ex =[m
+[32m+[m[32m                new MethodArgumentNotValidException(handlerMethod.getMethodParameters()[0], bindingResult);[m
+[32m+[m
+[32m+[m[32m        ResponseEntity<ErrorResponse> response = handler.handleValidationException(ex, request);[m
+[32m+[m
+[32m+[m[32m        assertEquals(HttpStatus.BAD_REQUEST, response.getStatusCode());[m
+[32m+[m[32m        ErrorResponse body = response.getBody();[m
+[32m+[m[32m        assertNotNull(body);[m
+[32m+[m[32m        assertNotNull(body.getErrores());[m
+[32m+[m[32m        assertEquals("debe ser un email válido", body.getErrores().get("email"));[m
+[32m+[m[32m        assertEquals("no debe estar vacío", body.getErrores().get("dni"));[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    @Test[m
+[32m+[m[32m    void devuelve500ParaExcepcionesNoControladas() {[m
+[32m+[m[32m        MockHttpServletRequest request = new MockHttpServletRequest("GET", "/api/reportes");[m
+[32m+[m
+[32m+[m[32m        ResponseEntity<ErrorResponse> response =[m
+[32m+[m[32m                handler.handleUnexpectedException(new RuntimeException("boom"), request);[m
+[32m+[m
+[32m+[m[32m        assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, response.getStatusCode());[m
+[32m+[m[32m        assertEquals(500, response.getBody().getStatus());[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    // Método "dummy" público (HandlerMethod requiere reflexión vía Class#getMethod) solo para[m
+[32m+[m[32m    // poder construir un MethodParameter válido en el test de validación.[m
+[32m+[m[32m    @SuppressWarnings("unused")[m
+[32m+[m[32m    public void metodoDummy(String parametro) {[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
